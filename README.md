@@ -1,283 +1,216 @@
-# Data-Analysis-Agent
-The agent operates on compressed schema metadata and structured analysis history, dramatically reducing computation cost and improving scalability.
+# 🧠 Data Science Agent (Low-Token EDA)
 
-# ============================================================
-# Code
-# ============================================================
+---
+
+## 📦 Project Structure
+
+```
+ds_agent/
+│
+├── agent.py
+├── schema_compressor.py
+├── eda_engine.py
+├── memory_manager.py
+├── llm_interface.py
+├── token_budget.py
+└── main.py
+```
+
+---
+
+# 1️⃣ Schema Compression Module
 
 import pandas as pd
 import numpy as np
-import hashlib
-from scipy.stats import entropy
-from typing import Dict, Any, List
-
-
-# ============================================================
-# Utility Functions
-# ============================================================
-
-def fingerprint_column(series: pd.Series, sample_size: int = 100) -> str:
-    """Create a stable fingerprint of a column distribution."""
-    series = series.dropna()
-    if len(series) == 0:
-        return "empty"
-
-    sample = series.sample(min(sample_size, len(series)), random_state=42)
-    return hashlib.md5(str(sample.values).encode()).hexdigest()
-
-
-def is_near_constant(series: pd.Series, threshold: float = 0.98) -> bool:
-    """Detect near-constant columns."""
-    if series.nunique() <= 1:
-        return True
-    top_freq = series.value_counts(normalize=True).iloc[0]
-    return top_freq >= threshold
-
-
-def is_high_cardinality(series: pd.Series, threshold_ratio: float = 0.5) -> bool:
-    """Detect ID-like high-cardinality columns."""
-    return series.nunique() / len(series) > threshold_ratio
-
-
-# ============================================================
-# Schema Compressor
-# ============================================================
 
 class SchemaCompressor:
-    def __init__(self, df: pd.DataFrame):
-        self.df = df
+    def __init__(self, top_k=5):
+        self.top_k = top_k
 
-    def compress(self) -> Dict[str, Any]:
+    def compress(self, df: pd.DataFrame) -> dict:
         schema_summary = {}
 
-        for col in self.df.columns:
-            series = self.df[col]
+        for col in df.columns:
+            series = df[col]
+            col_type = str(series.dtype)
 
-            col_summary = {
-                "dtype": str(series.dtype),
-                "missing_pct": float(series.isna().mean()),
-                "n_unique": int(series.nunique()),
-                "fingerprint": fingerprint_column(series)
+            summary = {
+                "type": col_type,
+                "null_pct": round(series.isna().mean(), 4),
             }
 
-            if pd.api.types.is_numeric_dtype(series):
-                col_summary.update({
-                    "mean": float(series.mean()) if series.notna().any() else 0.0,
-                    "std": float(series.std()) if series.notna().any() else 0.0,
-                    "min": float(series.min()) if series.notna().any() else 0.0,
-                    "max": float(series.max()) if series.notna().any() else 0.0
-                })
-            else:
-                top_vals = series.value_counts(normalize=True).head(5)
-                col_summary.update({
-                    "top_categories": top_vals.to_dict(),
-                    "entropy": float(entropy(top_vals)) if len(top_vals) > 1 else 0.0
+            if np.issubdtype(series.dtype, np.number):
+                summary.update({
+                    "min": float(series.min()) if not series.isna().all() else None,
+                    "max": float(series.max()) if not series.isna().all() else None,
+                    "mean": float(series.mean()) if not series.isna().all() else None,
+                    "std": float(series.std()) if not series.isna().all() else None,
                 })
 
-            schema_summary[col] = col_summary
+            elif series.nunique() < 50:
+                top_vals = series.value_counts().head(self.top_k).index.tolist()
+                summary.update({
+                    "cardinality": int(series.nunique()),
+                    "top_values": top_vals
+                })
+
+            schema_summary[col] = summary
 
         return schema_summary
 
+    def to_compact_string(self, schema_summary: dict) -> str:
+        parts = []
+        for col, meta in schema_summary.items():
+            if meta["type"].startswith("int") or meta["type"].startswith("float"):
+                parts.append(
+                    f"{col}:{meta['type']}|μ={meta.get('mean')}|σ={meta.get('std')}|null={meta['null_pct']}"
+                )
+            else:
+                parts.append(
+                    f"{col}:{meta['type']}|card={meta.get('cardinality')}|null={meta['null_pct']}"
+                )
 
-# ============================================================
-# History Compressor
-# ============================================================
+        return "\n".join(parts)
+```
 
-class HistoryCompressor:
-    def __init__(self, max_steps: int = 10):
-        self.history = []
-        self.max_steps = max_steps
+---
 
-    def add_step(self, action: str, columns: List[str], result_summary: str):
-        compressed = {
-            "action": action,
-            "columns": columns,
-            "summary": result_summary[:300]
+# 2️⃣ Compressed Memory Manager
+
+class MemoryManager:
+    def __init__(self):
+        self.steps = []
+
+    def add_step(self, step_type: str, details: str):
+        entry = f"{step_type}:{details}"
+        self.steps.append(entry)
+
+    def get_compressed_history(self, max_steps=10):
+        return "\n".join(self.steps[-max_steps:])
+```
+
+Instead of storing verbose conversation, we store structured steps like:
+
+```
+distribution:age
+correlation:age,income=0.62
+filter:region=EU
+```
+
+---
+
+# 3️⃣ Automated EDA Engine
+
+import pandas as pd
+import numpy as np
+
+class EDAEngine:
+    def __init__(self, memory_manager):
+        self.memory = memory_manager
+
+    def basic_overview(self, df: pd.DataFrame):
+        overview = {
+            "rows": df.shape[0],
+            "columns": df.shape[1],
+            "missing_pct": df.isna().mean().mean()
         }
+        self.memory.add_step("overview", str(overview))
+        return overview
 
-        self.history.append(compressed)
+    def correlations(self, df: pd.DataFrame):
+        numeric_df = df.select_dtypes(include=np.number)
+        corr = numeric_df.corr()
+        self.memory.add_step("correlation", "matrix_computed")
+        return corr
 
-        if len(self.history) > self.max_steps:
-            self.history = self.history[-self.max_steps:]
+    def distribution(self, df: pd.DataFrame, column: str):
+        if column not in df.columns:
+            return None
+        desc = df[column].describe()
+        self.memory.add_step("distribution", column)
+        return desc
+```
 
-    def summarize(self) -> Dict[str, Any]:
-        return {
-            "recent_steps": self.history,
-            "total_steps": len(self.history)
-        }
+---
 
+# 4️⃣ Token Budget Manager
 
-# ============================================================
-# Execution Engine
-# ============================================================
+class TokenBudget:
+    def __init__(self, max_tokens=4000):
+        self.max_tokens = max_tokens
 
-class ExecutionEngine:
-    def __init__(self, df: pd.DataFrame):
-        self.df = df
+    def estimate_tokens(self, text: str):
+        return int(len(text) / 4)  # rough approximation
 
-    def execute(self, action_dict: Dict[str, Any]) -> Dict[str, Any]:
-        action = action_dict["action"]
-        cols = action_dict.get("columns", [])
+    def enforce_limit(self, text: str):
+        if self.estimate_tokens(text) > self.max_tokens:
+            return text[: self.max_tokens * 4]
+        return text
+```
 
-        if action == "correlation_analysis":
-            result = self.df[cols].corr().to_dict()
+---
 
-        elif action == "groupby_mean":
-            result = self.df.groupby(cols[0])[cols[1]].mean().to_dict()
+# 5️⃣ LLM Interface (Token-Optimized Prompting)
 
-        elif action == "missing_analysis":
-            result = self.df[cols].isna().mean().to_dict()
+from openai import OpenAI
 
-        elif action == "outlier_detection":
-            result = {}
-            for col in cols:
-                q1 = self.df[col].quantile(0.25)
-                q3 = self.df[col].quantile(0.75)
-                iqr = q3 - q1
-                lower = q1 - 1.5 * iqr
-                upper = q3 + 1.5 * iqr
-                outliers = ((self.df[col] < lower) | (self.df[col] > upper)).sum()
-                result[col] = {
-                    "outlier_count": int(outliers),
-                    "outlier_pct": float(outliers / len(self.df))
-                }
+class LLMInterface:
+    def __init__(self, api_key: str):
+        self.client = OpenAI(api_key=api_key)
 
-        else:
-            result = {"error": "Unknown action"}
+    def ask(self, query, schema_context, history_context):
+        prompt = f"""
+You are a data science assistant.
 
-        return result
+Compressed Schema:
+{schema_context}
 
+Compressed History:
+{history_context}
 
-# ============================================================
-# Rule-Based EDA Planner (Token-Free)
-# ============================================================
+User Question:
+{query}
 
-class EDAPlanner:
-    def __init__(self, schema: Dict[str, Any]):
-        self.schema = schema
+Provide structured analytical insights.
+"""
 
-    def plan(self) -> List[Dict[str, Any]]:
-        actions = []
+        response = self.client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
 
-        numeric_cols = [
-            col for col, meta in self.schema.items()
-            if "float" in meta["dtype"] or "int" in meta["dtype"]
-        ]
+        return response.choices[0].message.content
+```
 
-        categorical_cols = [
-            col for col, meta in self.schema.items()
-            if "object" in meta["dtype"] or "category" in meta["dtype"]
-        ]
+---
 
-        # Missing analysis
-        missing_cols = [
-            col for col, meta in self.schema.items()
-            if meta["missing_pct"] > 0.05
-        ]
-        if missing_cols:
-            actions.append({
-                "action": "missing_analysis",
-                "columns": missing_cols
-            })
+# 6️⃣ Agent Orchestrator
 
-        # Correlation analysis
-        if len(numeric_cols) >= 2:
-            actions.append({
-                "action": "correlation_analysis",
-                "columns": numeric_cols
-            })
-
-        # Outlier detection
-        if numeric_cols:
-            actions.append({
-                "action": "outlier_detection",
-                "columns": numeric_cols
-            })
-
-        # Groupby analysis
-        if numeric_cols and categorical_cols:
-            actions.append({
-                "action": "groupby_mean",
-                "columns": [categorical_cols[0], numeric_cols[0]]
-            })
-
-        return actions
-
-
-# ============================================================
-# Main Data Science Agent
-# ============================================================
+from schema_compressor import SchemaCompressor
+from memory_manager import MemoryManager
+from eda_engine import EDAEngine
+from token_budget import TokenBudget
+from llm_interface import LLMInterface
 
 class DataScienceAgent:
-    def __init__(self, df: pd.DataFrame):
-        self.df = df.copy()
+    def __init__(self, api_key):
+        self.schema_compressor = SchemaCompressor()
+        self.memory = MemoryManager()
+        self.eda = EDAEngine(self.memory)
+        self.token_budget = TokenBudget()
+        self.llm = LLMInterface(api_key)
+        self.schema_context = None
 
-        # Prune useless columns before anything else
-        self._prune_columns()
+    def load_dataset(self, df):
+        schema = self.schema_compressor.compress(df)
+        self.schema_context = self.schema_compressor.to_compact_string(schema)
 
-        self.schema = SchemaCompressor(self.df).compress()
-        self.memory = HistoryCompressor()
-        self.executor = ExecutionEngine(self.df)
-        self.planner = EDAPlanner(self.schema)
+    def run_eda(self, df):
+        self.eda.basic_overview(df)
+        self.eda.correlations(df)
 
-    def _prune_columns(self):
-        cols_to_drop = []
-
-        for col in self.df.columns:
-            series = self.df[col]
-            if is_near_constant(series):
-                cols_to_drop.append(col)
-            elif is_high_cardinality(series):
-                cols_to_drop.append(col)
-
-        self.df.drop(columns=cols_to_drop, inplace=True)
-
-    def run(self):
-        actions = self.planner.plan()
-
-        results = {}
-
-        for action in actions:
-            result = self.executor.execute(action)
-
-            summary = str(result)[:500]
-            self.memory.add_step(
-                action=action["action"],
-                columns=action["columns"],
-                result_summary=summary
-            )
-
-            results[action["action"]] = result
-
-        return {
-            "schema": self.schema,
-            "results": results,
-            "history": self.memory.summarize()
-        }
-
-
-# ============================================================
-# Example Usage
-# ============================================================
-
-if __name__ == "__main__":
-    # Example dataset
-    df = pd.DataFrame({
-        "age": np.random.randint(18, 70, 1000),
-        "income": np.random.normal(50000, 15000, 1000),
-        "gender": np.random.choice(["Male", "Female"], 1000),
-        "constant_col": 1,
-        "id_col": np.arange(1000)
-    })
-
-    agent = DataScienceAgent(df)
-    output = agent.run()
-
-    print("Compressed Schema:")
-    print(output["schema"])
-
-    print("\nEDA Results:")
-    print(output["results"])
-
-    print("\nCompressed History:")
-    print(output["history"])
+    def ask(self, query):
+        history = self.memory.get_compressed_history()
+        prompt = self.token_budget.enforce_limit(history)
+        return self.llm.ask(query, self.schema_context, prompt)
